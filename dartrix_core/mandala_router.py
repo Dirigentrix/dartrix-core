@@ -1,6 +1,7 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from enum import IntEnum
-from typing import Callable, Any, Dict, List
+from typing import Any, Callable, Dict, List, Tuple
+
 import numpy as np
 
 
@@ -11,12 +12,12 @@ class MandalaRing(IntEnum):
     RING_3_INTERFACE = 3    # Bramy wejściowe i telemetria
 
 
-@dataclass
+@dataclass(frozen=True)
 class MandalaPacket:
     source_ring: MandalaRing
     payload: np.ndarray
     intent: str = "TELEMETRY"
-    routed_nodes: List[int] = field(default_factory=list)
+    routed_nodes: Tuple[int, ...] = ()
 
 
 class MandalaRouter:
@@ -27,6 +28,8 @@ class MandalaRouter:
     """
 
     def __init__(self, symmetry: int = 8):
+        if symmetry <= 0:
+            raise ValueError("symmetry musi być dodatnie")
         self.symmetry = symmetry
         self.weights = np.array([2, 4, 6, 2, 7], dtype=float)
         self.subscribers: Dict[MandalaRing, List[Callable[[MandalaPacket], Any]]] = {
@@ -36,21 +39,30 @@ class MandalaRouter:
     def register(self, ring: MandalaRing, handler: Callable[[MandalaPacket], Any]) -> None:
         self.subscribers[ring].append(handler)
 
+    def _dispatch(self, ring: MandalaRing, packet: MandalaPacket) -> None:
+        for handler in self.subscribers[ring]:
+            handler(packet)
+
     def route(self, packet: MandalaPacket) -> Dict[str, Any]:
         # Ring 1: Walidacja integralności wektora
-        if packet.payload.shape != (5,):
-            raise ValueError(f"Wymagany wektor 5-elementowy, otrzymano {packet.payload.shape}")
-
-        if not np.all((packet.payload >= 0.0) & (packet.payload <= 1.0)):
+        payload = np.asarray(packet.payload, dtype=float)
+        if payload.shape != (5,):
+            raise ValueError(f"Wymagany wektor 5-elementowy, otrzymano {payload.shape}")
+        if not np.all(np.isfinite(payload)):
+            raise ValueError("Wektor telemetrii musi zawierać wyłącznie wartości skończone")
+        if not np.all((payload >= 0.0) & (payload <= 1.0)):
             raise ValueError("Wektor telemetrii musi być znormalizowany do przedziału [0, 1]")
 
         # Ring 2: Deterministyczne przypisanie do węzła symetrii
-        node_id = int(np.sum(packet.payload * 100)) % self.symmetry
-        packet.routed_nodes.append(node_id)
+        node_id = int(np.sum(payload * 100)) % self.symmetry
+        routed_packet = replace(
+            packet,
+            payload=payload.copy(),
+            routed_nodes=packet.routed_nodes + (node_id,),
+        )
 
         # Ring 0: Filtracja przez wagi 24627
-        score = float(np.dot(packet.payload, self.weights))
-
+        score = float(np.dot(payload, self.weights))
         if score < 3.0:
             state = "HARMONIA"
         elif score < 6.0:
@@ -60,13 +72,18 @@ class MandalaRouter:
         else:
             state = "KOSA"
 
-        for handler in self.subscribers.get(packet.source_ring, []):
-            handler(packet)
+        # Ring 0 always receives the validated decision. Non-emergency traffic
+        # is also sent to Ring 2; KOSA is intentionally isolated at the core.
+        self._dispatch(MandalaRing.RING_0_CORE, routed_packet)
+        target_ring = MandalaRing.RING_0_CORE if state == "KOSA" else MandalaRing.RING_2_SYMMETRY
+        if target_ring != MandalaRing.RING_0_CORE:
+            self._dispatch(target_ring, routed_packet)
 
         return {
             "score": score,
             "state": state,
             "node_id": node_id,
             "symmetry_pool": self.symmetry,
-            "routed": True
+            "target_ring": target_ring,
+            "routed": True,
         }
